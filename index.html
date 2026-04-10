@@ -1615,7 +1615,8 @@
       <label id="new-pwd-label" data-i18n="settings.new_password_label">新密码</label>
       <input type="password" id="setting-new-pwd" placeholder="输入新密码..." data-i18n-placeholder="settings.new_password_placeholder" />
     </div>
-    <div style="display:flex;justify-content:flex-end;margin-bottom:8px">
+    <div style="display:flex;justify-content:flex-end;gap:8px;margin-bottom:8px">
+      <button class="btn btn-cancel" id="logout-btn" data-i18n="settings.logout_btn">退出登录</button>
       <button class="btn btn-primary" id="change-password-btn" data-i18n="settings.change_password_btn">修改密码</button>
     </div>
     <hr style="border:none;border-top:1px solid var(--border);margin:16px 0" />
@@ -1675,6 +1676,8 @@ const TRANSLATIONS = {
     'login.setup_subtitle': '首次使用，请设置访问密码',
     'login.setup_btn': '设置并登录',
     'login.setup_password': '设置访问密码',
+    'login.temp_subtitle': '请使用服务端终端输出的临时密码登录，然后立即修改密码',
+    'login.temp_password': '输入临时密码',
     'login.empty': '请输入密码',
     'login.setup_failed': '设置失败',
     'login.failed': '登录失败',
@@ -1754,6 +1757,7 @@ const TRANSLATIONS = {
     'settings.current_password_label': '当前密码', 'settings.current_password_placeholder': '输入当前密码...',
     'settings.new_password_label': '新密码', 'settings.new_password_placeholder': '输入新密码...',
     'settings.set_password_label': '设置密码',
+    'settings.logout_btn': '退出登录',
     'settings.change_password_btn': '修改密码', 'settings.ai_section': 'AI 解释',
     'settings.provider_label': 'AI 服务商', 'settings.api_key_label': 'API Key',
     'settings.api_key_placeholder': '输入 API Key...',
@@ -1797,6 +1801,7 @@ const TRANSLATIONS = {
     'toast.settings_saved': 'AI 设置已保存', 'toast.settings_failed': '保存失败: ',
     'toast.fill_passwords': '请填写当前密码和新密码',
     'toast.password_changed': '密码修改成功', 'toast.password_failed': '修改失败: ',
+    'toast.change_temp_password': '已使用临时密码登录，请立即修改密码',
     'toast.session_resumed': '会话已恢复', 'toast.resume_failed': '恢复失败: ',
     'toast.load_failed': '加载失败: ',
     'dir.selected': '已选:', 'dir.select_btn': '选择此目录',
@@ -1822,6 +1827,8 @@ const TRANSLATIONS = {
     'login.setup_subtitle': 'First time? Set an access password',
     'login.setup_btn': 'Set & Log In',
     'login.setup_password': 'Set access password',
+    'login.temp_subtitle': 'Sign in with the temporary password shown in the server terminal, then change it immediately',
+    'login.temp_password': 'Temporary password',
     'login.empty': 'Please enter a password',
     'login.setup_failed': 'Setup failed',
     'login.failed': 'Login failed',
@@ -1901,6 +1908,7 @@ const TRANSLATIONS = {
     'settings.current_password_label': 'Current Password', 'settings.current_password_placeholder': 'Enter current password...',
     'settings.new_password_label': 'New Password', 'settings.new_password_placeholder': 'Enter new password...',
     'settings.set_password_label': 'Set Password',
+    'settings.logout_btn': 'Log Out',
     'settings.change_password_btn': 'Change Password', 'settings.ai_section': 'AI Explain',
     'settings.provider_label': 'Provider', 'settings.api_key_label': 'API Key',
     'settings.api_key_placeholder': 'Enter API Key...',
@@ -1944,6 +1952,7 @@ const TRANSLATIONS = {
     'toast.settings_saved': 'AI settings saved', 'toast.settings_failed': 'Save failed: ',
     'toast.fill_passwords': 'Please fill in both current and new password',
     'toast.password_changed': 'Password changed successfully', 'toast.password_failed': 'Change failed: ',
+    'toast.change_temp_password': 'Signed in with the temporary password. Change it now.',
     'toast.session_resumed': 'Session resumed', 'toast.resume_failed': 'Resume failed: ',
     'toast.load_failed': 'Load failed: ',
     'dir.selected': 'Selected:', 'dir.select_btn': 'Use This Directory',
@@ -3914,7 +3923,7 @@ document.getElementById('ai-settings-save').addEventListener('click', async () =
 document.getElementById('change-password-btn').addEventListener('click', async () => {
   const cur = document.getElementById('setting-current-pwd');
   const nw = document.getElementById('setting-new-pwd');
-  if (!cur.value || !nw.value) { toast(t('toast.fill_passwords'), 'error'); return; }
+  if ((!_passwordIsAuto && !cur.value) || !nw.value) { toast(t('toast.fill_passwords'), 'error'); return; }
   try {
     const r = await fetch('/api/change-password', {
       method: 'PUT',
@@ -3923,11 +3932,24 @@ document.getElementById('change-password-btn').addEventListener('click', async (
     });
     const data = await r.json();
     if (!r.ok) throw new Error(data.error);
+    _passwordIsAuto = false;
+    updatePasswordUI();
     toast(t('toast.password_changed'), 'success');
     cur.value = '';
     nw.value = '';
   } catch (e) {
     toast(t('toast.password_failed') + e.message, 'error');
+  }
+});
+
+document.getElementById('logout-btn').addEventListener('click', async () => {
+  try {
+    const r = await fetch('/api/logout', { method: 'POST' });
+    const data = await r.json();
+    if (!r.ok) throw new Error(data.error);
+    location.reload();
+  } catch (e) {
+    toast(t('toast.settings_failed') + e.message, 'error');
   }
 });
 
@@ -3949,13 +3971,14 @@ async function initApp() {
     _passwordIsAuto = d.passwordIsAuto === true;
     if (d.authenticated) {
       document.getElementById('login-overlay').classList.add('hidden');
+      if (_passwordIsAuto) toast(t('toast.change_temp_password'));
       connectWS();
     } else {
       document.getElementById('login-overlay').classList.remove('hidden');
       if (_passwordIsAuto) {
-        document.getElementById('login-password').placeholder = t('login.setup_password');
-        document.querySelector('.login-box .subtitle').textContent = t('login.setup_subtitle');
-        document.getElementById('login-btn').textContent = t('login.setup_btn');
+        document.getElementById('login-password').placeholder = t('login.temp_password');
+        document.querySelector('.login-box .subtitle').textContent = t('login.temp_subtitle');
+        document.getElementById('login-btn').textContent = t('login.btn');
       }
     }
     updatePasswordUI();
@@ -3984,31 +4007,23 @@ document.getElementById('login-form').addEventListener('submit', async (e) => {
   btn.disabled = true;
   errEl.textContent = '';
   try {
-    if (_passwordIsAuto) {
-      if (!input.value) { errEl.textContent = t('login.empty'); btn.disabled = false; return; }
-      const cr = await fetch('/api/change-password', {
-        method: 'PUT',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ currentPassword: '', newPassword: input.value }),
-      });
-      if (!cr.ok) { const cd = await cr.json(); errEl.textContent = cd.error || t('login.setup_failed'); btn.disabled = false; return; }
-      _passwordIsAuto = false;
+    if (!input.value) {
+      errEl.textContent = t('login.empty');
+      btn.disabled = false;
+      return;
+    }
+    const r = await fetch('/api/login', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ password: input.value }),
+    });
+    const d = await r.json();
+    if (r.ok && d.ok) {
       document.getElementById('login-overlay').classList.add('hidden');
-      updatePasswordUI();
+      if (_passwordIsAuto) toast(t('toast.change_temp_password'));
       connectWS();
     } else {
-      const r = await fetch('/api/login', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ password: input.value }),
-      });
-      const d = await r.json();
-      if (r.ok && d.ok) {
-        document.getElementById('login-overlay').classList.add('hidden');
-        connectWS();
-      } else {
-        errEl.textContent = d.error || t('login.failed');
-      }
+      errEl.textContent = d.error || t('login.failed');
     }
   } catch (err) {
     errEl.textContent = t('login.network_error');
@@ -4226,7 +4241,7 @@ document.getElementById('ft-browse-dir').addEventListener('click', () => {
   browser.classList.toggle('hidden');
   if (!browser.classList.contains('hidden')) {
     const current = document.getElementById('ft-cwd').value.trim();
-    ftBrowseDir(current || '/Users');
+    ftBrowseDir(current || '');
   }
 });
 
@@ -4377,7 +4392,7 @@ document.getElementById('resume-browse-dir').addEventListener('click', () => {
   browser.classList.toggle('hidden');
   if (!browser.classList.contains('hidden')) {
     const current = document.getElementById('resume-cwd').value.trim();
-    resumeBrowseDir(current || (location.protocol === 'file:' ? '' : '') || '/Users');
+    resumeBrowseDir(current || '');
   }
 });
 

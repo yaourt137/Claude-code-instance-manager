@@ -69,7 +69,6 @@ for (const [key, cfg] of Object.entries(CLI_CONFIGS)) {
   CLI_PATHS[key] = detectCLIPath(cfg.cmd);
 }
 const HAS_ANY_CLI = pty && Object.values(CLI_PATHS).some(p => p);
-const DESKTOP     = (process.env.HOME || "") + "/Desktop";
 
 // ─── 终端实例：允许的 shell 命令白名单 ─────────────────────────────────────────
 const ALLOWED_SHELL_CMDS = {
@@ -77,6 +76,172 @@ const ALLOWED_SHELL_CMDS = {
   "npm start":    { bin: "npm", args: ["start"],       label: "npm start" },
 };
 const NPM_PATH = detectCLIPath("npm");
+const HOME = process.env.HOME || os.homedir() || __dirname;
+const DESKTOP = path.join(HOME, "Desktop");
+const CONFIG_DIR = process.env.MANAGER_DATA_DIR
+  ? path.resolve(process.env.MANAGER_DATA_DIR)
+  : path.join(HOME, ".claude-code-manager");
+const SESSION_TTL_MS = Math.max(15 * 60 * 1000, parseInt(process.env.SESSION_TTL_MS, 10) || (24 * 60 * 60 * 1000));
+const LOGIN_RATE_LIMIT_WINDOW_MS = 15 * 60 * 1000;
+const PASSWORD_RATE_LIMIT_WINDOW_MS = 15 * 60 * 1000;
+const COOKIE_NAME = "session_token";
+const BIND_HOST = process.env.HOST || "127.0.0.1";
+const PUBLIC_BASE_URL = String(process.env.PUBLIC_BASE_URL || "").trim();
+const EXTRA_ALLOWED_ORIGINS = String(process.env.MANAGER_ALLOWED_ORIGINS || "")
+  .split(",")
+  .map(s => s.trim())
+  .filter(Boolean);
+const DEFAULT_ALLOWED_ROOTS = [HOME];
+const ALLOWED_ROOTS = parseAllowedRoots(process.env.MANAGER_ALLOWED_ROOTS);
+
+function ensureDirSync(dirPath) {
+  try { fs.mkdirSync(dirPath, { recursive: true }); } catch (_) {}
+}
+
+ensureDirSync(CONFIG_DIR);
+
+function getConfigFilePath(filename) {
+  const target = path.join(CONFIG_DIR, filename);
+  const legacy = path.join(__dirname, filename);
+  if (!fs.existsSync(target) && legacy !== target && fs.existsSync(legacy)) {
+    try {
+      fs.renameSync(legacy, target);
+    } catch (_) {
+      try { fs.copyFileSync(legacy, target); } catch (__) {}
+    }
+  }
+  return target;
+}
+
+function parseAllowedRoots(raw) {
+  const roots = String(raw || "")
+    .split(",")
+    .map(s => s.trim())
+    .filter(Boolean)
+    .map(expandUserPath);
+  return (roots.length ? roots : DEFAULT_ALLOWED_ROOTS)
+    .map(p => path.resolve(p))
+    .filter(Boolean);
+}
+
+function expandUserPath(input) {
+  const value = String(input || "").trim();
+  if (!value) return value;
+  if (value === "~") return HOME;
+  if (value.startsWith("~/")) return path.join(HOME, value.slice(2));
+  return value;
+}
+
+function isPathInside(parentPath, childPath) {
+  const parent = path.resolve(parentPath);
+  const child = path.resolve(childPath);
+  if (parent === child) return true;
+  const rel = path.relative(parent, child);
+  return rel && !rel.startsWith("..") && !path.isAbsolute(rel);
+}
+
+function isAllowedPath(targetPath) {
+  const resolved = path.resolve(targetPath);
+  return ALLOWED_ROOTS.some(root => isPathInside(root, resolved));
+}
+
+function resolveManagedPath(input, fallbackPath) {
+  const raw = String(input || fallbackPath || "").trim() || fallbackPath || DESKTOP;
+  const resolved = path.resolve(expandUserPath(raw));
+  if (!isAllowedPath(resolved)) {
+    throw new Error("路径不在允许范围内");
+  }
+  return resolved;
+}
+
+function getRequestIP(req) {
+  const forwarded = req.headers["x-forwarded-for"];
+  if (typeof forwarded === "string" && forwarded.trim()) {
+    return forwarded.split(",")[0].trim();
+  }
+  return req.socket?.remoteAddress || "unknown";
+}
+
+function createRateLimiter(windowMs, maxAttempts) {
+  const attempts = new Map();
+  return (req, res, next) => {
+    const now = Date.now();
+    const key = getRequestIP(req);
+    const entry = attempts.get(key);
+    if (!entry || entry.resetAt <= now) {
+      attempts.set(key, { count: 1, resetAt: now + windowMs });
+      return next();
+    }
+    entry.count += 1;
+    if (entry.count > maxAttempts) {
+      const retryAfter = Math.max(1, Math.ceil((entry.resetAt - now) / 1000));
+      res.set("Retry-After", String(retryAfter));
+      return res.status(429).json({ error: "请求过于频繁，请稍后重试" });
+    }
+    next();
+  };
+}
+
+function isLoopbackHost(host) {
+  return host === "127.0.0.1" || host === "::1" || host === "localhost";
+}
+
+function isRequestSecure(req) {
+  const proto = String(req.headers["x-forwarded-proto"] || "").split(",")[0].trim().toLowerCase();
+  return proto === "https" || !!req.socket?.encrypted;
+}
+
+function getAllowedHosts(req) {
+  const hosts = new Set();
+  const reqHost = String(req.headers.host || "").trim().toLowerCase();
+  if (reqHost) hosts.add(reqHost);
+  if (PUBLIC_BASE_URL) {
+    try { hosts.add(new URL(PUBLIC_BASE_URL).host.toLowerCase()); } catch (_) {}
+  }
+  if (tunnelState.url) {
+    try { hosts.add(new URL(tunnelState.url).host.toLowerCase()); } catch (_) {}
+  }
+  for (const origin of EXTRA_ALLOWED_ORIGINS) {
+    try { hosts.add(new URL(origin).host.toLowerCase()); } catch (_) {}
+  }
+  const port = process.env.PORT || 3000;
+  hosts.add("127.0.0.1:" + port);
+  hosts.add("localhost:" + port);
+  getLocalIPs().forEach(ip => hosts.add(ip + ":" + port));
+  return hosts;
+}
+
+function isAllowedOrigin(req) {
+  const origin = req.headers.origin;
+  if (!origin) return true;
+  try {
+    const parsed = new URL(origin);
+    const normalizedOrigin = parsed.origin.toLowerCase();
+    if (EXTRA_ALLOWED_ORIGINS.some(item => item.toLowerCase() === normalizedOrigin)) return true;
+    return getAllowedHosts(req).has(parsed.host.toLowerCase());
+  } catch (_) {
+    return false;
+  }
+}
+
+function setSessionCookie(req, res, token) {
+  res.cookie(COOKIE_NAME, token, {
+    httpOnly: true,
+    sameSite: "strict",
+    secure: isRequestSecure(req),
+    maxAge: SESSION_TTL_MS,
+    path: "/",
+  });
+}
+
+function clearSessionCookie(req, res) {
+  res.clearCookie(COOKIE_NAME, {
+    httpOnly: true,
+    sameSite: "strict",
+    secure: isRequestSecure(req),
+    path: "/",
+  });
+}
 
 // ─── Cloudflare Tunnel ──────────────────────────────────────────────────────
 const TUNNEL_AUTO_START = process.env.TUNNEL === "1" || process.env.TUNNEL === "true";
@@ -249,13 +414,14 @@ async function pushBranch(repoPath, branchName, remote) {
 }
 
 // ─── 最近目录记录 ────────────────────────────────────────────────────────────
-const RECENT_DIRS_PATH = path.join(__dirname, "recent-dirs.json");
+const RECENT_DIRS_PATH = getConfigFilePath("recent-dirs.json");
 const RECENT_DIRS_MAX = 30;
 
 function loadRecentDirs() {
   try {
     if (fs.existsSync(RECENT_DIRS_PATH)) {
-      return JSON.parse(fs.readFileSync(RECENT_DIRS_PATH, "utf-8"));
+      return JSON.parse(fs.readFileSync(RECENT_DIRS_PATH, "utf-8"))
+        .filter(d => d && d.path && isAllowedPath(d.path));
     }
   } catch (_) {}
   return [];
@@ -309,7 +475,7 @@ function scanClaudeProjectDirs() {
         for (const line of lines) {
           try {
             const obj = JSON.parse(line);
-            if (obj.cwd) {
+            if (obj.cwd && isAllowedPath(obj.cwd)) {
               result.push({ path: obj.cwd, lastUsed: new Date(latestMtime).toISOString(), source: "claude" });
               break;
             }
@@ -322,7 +488,9 @@ function scanClaudeProjectDirs() {
 }
 
 // ─── 认证模块 ──────────────────────────────────────────────────────────────────
-const AUTH_SETTINGS_PATH = path.join(__dirname, "auth-settings.json");
+const AUTH_SETTINGS_PATH = getConfigFilePath("auth-settings.json");
+const loginRateLimiter = createRateLimiter(LOGIN_RATE_LIMIT_WINDOW_MS, 10);
+const passwordRateLimiter = createRateLimiter(PASSWORD_RATE_LIMIT_WINDOW_MS, 8);
 
 function hashPassword(plain, salt) {
   salt = salt || crypto.randomBytes(16).toString("hex");
@@ -374,12 +542,42 @@ if (process.env.AUTH_PASSWORD) {
   ({ hash: AUTH_HASH, salt: AUTH_SALT } = hashPassword(_autoGenPassword));
   AUTH_PASSWORD_IS_AUTO = true;
 }
-const sessions = new Set(); // 存储有效的 session token
+const sessions = new Map(); // token -> session meta
+
+function clearExpiredSessions() {
+  const now = Date.now();
+  for (const [token, session] of sessions.entries()) {
+    if (!session || session.expiresAt <= now) sessions.delete(token);
+  }
+}
 
 function createSession() {
+  clearExpiredSessions();
   const token = crypto.randomBytes(32).toString("hex");
-  sessions.add(token);
+  sessions.set(token, { createdAt: Date.now(), expiresAt: Date.now() + SESSION_TTL_MS });
   return token;
+}
+
+function getSessionByToken(token) {
+  if (!token) return null;
+  const session = sessions.get(token);
+  if (!session) return null;
+  if (session.expiresAt <= Date.now()) {
+    sessions.delete(token);
+    return null;
+  }
+  return session;
+}
+
+function touchSession(token) {
+  const session = getSessionByToken(token);
+  if (!session) return null;
+  session.expiresAt = Date.now() + SESSION_TTL_MS;
+  return session;
+}
+
+function revokeSession(token) {
+  if (token) sessions.delete(token);
 }
 
 function parseCookies(cookieHeader) {
@@ -392,19 +590,34 @@ function parseCookies(cookieHeader) {
   return cookies;
 }
 
-function isAuthenticated(req) {
+function getSessionToken(req) {
   const cookies = parseCookies(req.headers.cookie);
-  return sessions.has(cookies.session_token);
+  return cookies[COOKIE_NAME] || null;
+}
+
+function isAuthenticated(req) {
+  return !!getSessionByToken(getSessionToken(req));
+}
+
+function originMiddleware(req, res, next) {
+  const method = String(req.method || "GET").toUpperCase();
+  if (method === "GET" || method === "HEAD" || method === "OPTIONS") return next();
+  if (isAllowedOrigin(req)) return next();
+  res.status(403).json({ error: "请求来源不被允许" });
 }
 
 function authMiddleware(req, res, next) {
   // 登录接口和认证检查接口不需要鉴权
   if (req.path === "/api/login" || req.path === "/api/auth-check") return next();
-  // 首次设置密码时（自动生成密码状态），允许未认证用户调用修改密码接口
-  if (req.path === "/api/change-password" && AUTH_PASSWORD_IS_AUTO) return next();
   // 静态文件中只放行 index.html 和必要资源（未认证时前端需要加载登录界面）
   if (req.method === "GET" && (req.path === "/" || req.path === "/index.html" || req.path === "/manifest.json" || req.path === "/sw.js" || req.path.startsWith("/icon-"))) return next();
-  if (isAuthenticated(req)) return next();
+  const token = getSessionToken(req);
+  if (getSessionByToken(token)) {
+    touchSession(token);
+    req.sessionToken = token;
+    setSessionCookie(req, res, token);
+    return next();
+  }
   res.status(401).json({ error: "未授权，请先登录" });
 }
 
@@ -421,8 +634,10 @@ function getLocalIPs() {
   return ips;
 }
 
+setInterval(clearExpiredSessions, 5 * 60 * 1000).unref();
+
 // ─── AI 解释模块 ────────────────────────────────────────────────────────────
-const AI_SETTINGS_PATH = path.join(__dirname, "ai-settings.json");
+const AI_SETTINGS_PATH = getConfigFilePath("ai-settings.json");
 
 function loadAISettings() {
   try {
@@ -557,6 +772,9 @@ class InstanceManager {
     if (this.instances.has(id)) throw new Error("实例 " + id + " 已存在");
     const type = (cliType && CLI_CONFIGS[cliType]) ? cliType : "claude";
     const isOrchestrator = role === "orchestrator";
+    const resolvedCwd = resolveManagedPath(cwd || "", DESKTOP);
+    const cwdStat = fs.statSync(resolvedCwd);
+    if (!cwdStat.isDirectory()) throw new Error("工作目录不存在");
 
     // Orchestrator: 生成 MCP 配置并注入 CLI 参数
     let mcpConfigPath = null;
@@ -602,7 +820,7 @@ class InstanceManager {
 
     const instance = {
       id, label: label || id, prompt: finalPrompt,
-      cwd: cwd || DESKTOP,
+      cwd: resolvedCwd,
       cliType: type,
       cliArgs: Array.isArray(cliArgs) ? cliArgs : [],
       role: isOrchestrator ? "orchestrator" : "worker",
@@ -839,17 +1057,24 @@ class InstanceManager {
     if (!cmdConfig) throw new Error("不允许的命令: " + cmd);
     if (!NPM_PATH) throw new Error("npm 未安装或不可用");
     if (!pty) throw new Error("node-pty 不可用");
+    const resolvedCwd = resolveManagedPath(cwd || "", DESKTOP);
+    const cwdStat = fs.statSync(resolvedCwd);
+    if (!cwdStat.isDirectory()) throw new Error("工作目录不存在");
+    const normalizedPort = port ? String(port).trim() : "";
+    if (normalizedPort && !/^\d{2,5}$/.test(normalizedPort)) {
+      throw new Error("端口格式无效");
+    }
 
     const instance = {
       id, label: label || cmdConfig.label,
       prompt: "",
-      cwd: cwd || DESKTOP,
+      cwd: resolvedCwd,
       cliType: "shell",
       cliArgs: [],
       role: "terminal",
       category: "terminal",
       shellCmd: cmd,
-      shellPort: port ? String(port) : "",
+      shellPort: normalizedPort,
       status: "running",
       output: "",
       startedAt: new Date().toISOString(),
@@ -1023,65 +1248,81 @@ const server  = http.createServer(app);
 const wss     = new WebSocket.Server({ server });
 const manager = new InstanceManager();
 
-app.use(express.json());
+function closeUnauthorizedSockets(reason) {
+  wss.clients.forEach(ws => {
+    if (ws.readyState !== WebSocket.OPEN) return;
+    if (!getSessionByToken(ws._sessionToken)) {
+      try { ws.close(4001, reason || "会话已失效"); } catch (_) {}
+    }
+  });
+}
+
+app.set("trust proxy", true);
+app.use(express.json({ limit: "1mb" }));
+app.use((req, res, next) => {
+  res.set("X-Frame-Options", "DENY");
+  res.set("X-Content-Type-Options", "nosniff");
+  res.set("Referrer-Policy", "no-referrer");
+  next();
+});
+app.use(originMiddleware);
 app.use(authMiddleware);
 app.use(express.static(path.join(__dirname)));
 
 // ─── 认证 API ─────────────────────────────────────────────────────────────────
-app.post("/api/login", (req, res) => {
+app.post("/api/login", loginRateLimiter, (req, res) => {
   const { password } = req.body;
   if (!verifyPassword(password, AUTH_HASH, AUTH_SALT)) {
     return res.status(403).json({ error: "密码错误" });
   }
   const token = createSession();
-  res.cookie("session_token", token, {
-    httpOnly: true,
-    sameSite: "lax",
-    maxAge: 7 * 24 * 60 * 60 * 1000, // 7 天
-  });
-  res.json({ ok: true });
+  setSessionCookie(req, res, token);
+  res.json({ ok: true, passwordIsAuto: AUTH_PASSWORD_IS_AUTO });
 });
 
 app.get("/api/auth-check", (req, res) => {
-  res.json({ authenticated: isAuthenticated(req), passwordIsAuto: AUTH_PASSWORD_IS_AUTO });
+  const authenticated = isAuthenticated(req);
+  res.json({ authenticated, passwordIsAuto: AUTH_PASSWORD_IS_AUTO, sessionTtlMs: SESSION_TTL_MS });
 });
 
-app.put("/api/change-password", (req, res) => {
+app.post("/api/logout", (req, res) => {
+  revokeSession(getSessionToken(req));
+  closeUnauthorizedSockets("会话已退出");
+  clearSessionCookie(req, res);
+  res.json({ ok: true });
+});
+
+app.put("/api/change-password", passwordRateLimiter, (req, res) => {
   const { currentPassword, newPassword } = req.body;
+  if (!newPassword || String(newPassword).trim().length < 8) {
+    return res.status(400).json({ error: "新密码至少需要 8 个字符" });
+  }
   if (!AUTH_PASSWORD_IS_AUTO && !verifyPassword(currentPassword, AUTH_HASH, AUTH_SALT)) {
     return res.status(403).json({ error: "当前密码错误" });
   }
-  if (!newPassword) {
-    return res.status(400).json({ error: "新密码不能为空" });
-  }
   try {
-    ({ hash: AUTH_HASH, salt: AUTH_SALT } = saveAuthSettings(newPassword));
+    ({ hash: AUTH_HASH, salt: AUTH_SALT } = saveAuthSettings(String(newPassword).trim()));
   } catch (e) {
     return res.status(500).json({ error: "保存失败: " + e.message });
   }
   AUTH_PASSWORD_IS_AUTO = false;
   sessions.clear();
   const token = createSession();
-  res.cookie("session_token", token, {
-    httpOnly: true,
-    sameSite: "lax",
-    maxAge: 7 * 24 * 60 * 60 * 1000,
-  });
+  closeUnauthorizedSockets("密码已更新");
+  setSessionCookie(req, res, token);
   res.json({ ok: true });
 });
 
 app.get("/api/browse", (req, res) => {
-  let reqPath = req.query.path || DESKTOP;
-  if (reqPath === "~" || reqPath.startsWith("~/"))
-    reqPath = reqPath.replace("~", process.env.HOME || "");
-  reqPath = path.resolve(reqPath);
   try {
+    const reqPath = resolveManagedPath(req.query.path || "", DESKTOP);
     const entries = fs.readdirSync(reqPath, { withFileTypes: true });
     const dirs = entries
       .filter(e => e.isDirectory() && !e.name.startsWith("."))
       .map(e => ({ name: e.name, path: path.join(reqPath, e.name) }))
       .sort((a, b) => a.name.localeCompare(b.name));
-    const parent = path.dirname(reqPath) !== reqPath ? path.dirname(reqPath) : null;
+    const rawParent = path.dirname(reqPath) !== reqPath ? path.dirname(reqPath) : null;
+    const parent = rawParent && isAllowedPath(rawParent) ? rawParent : null;
     res.json({ current: reqPath, parent, dirs });
   } catch (err) { res.status(400).json({ error: err.message }); }
 });
@@ -1105,6 +1346,7 @@ app.get("/api/recent-dirs", (req, res) => {
     const tooGeneric = new Set(["/", home, home + "/Desktop", home + "/Documents", home + "/Downloads"]);
     const valid = merged.filter(d => {
       if (tooGeneric.has(d.path)) return false;
+      if (!isAllowedPath(d.path)) return false;
       try { return fs.statSync(d.path).isDirectory(); } catch (_) { return false; }
     });
     valid.sort((a, b) => new Date(b.lastUsed) - new Date(a.lastUsed));
@@ -1113,11 +1355,63 @@ app.get("/api/recent-dirs", (req, res) => {
 });
 
 // ─── 图片上传 API（multer）────────────────────────────────────────────────────
+const IMAGE_SIGNATURES = [
+  {
+    mime: "image/png",
+    ext: ".png",
+    matches: (buf) => buf.length >= 8 &&
+      buf[0] === 0x89 && buf[1] === 0x50 && buf[2] === 0x4e && buf[3] === 0x47 &&
+      buf[4] === 0x0d && buf[5] === 0x0a && buf[6] === 0x1a && buf[7] === 0x0a,
+  },
+  {
+    mime: "image/jpeg",
+    ext: ".jpg",
+    matches: (buf) => buf.length >= 3 &&
+      buf[0] === 0xff && buf[1] === 0xd8 && buf[2] === 0xff,
+  },
+  {
+    mime: "image/gif",
+    ext: ".gif",
+    matches: (buf) => buf.length >= 6 && (
+      buf.slice(0, 6).toString("ascii") === "GIF87a" ||
+      buf.slice(0, 6).toString("ascii") === "GIF89a"
+    ),
+  },
+  {
+    mime: "image/webp",
+    ext: ".webp",
+    matches: (buf) => buf.length >= 12 &&
+      buf.slice(0, 4).toString("ascii") === "RIFF" &&
+      buf.slice(8, 12).toString("ascii") === "WEBP",
+  },
+];
+
+function detectImageInfo(buffer) {
+  return IMAGE_SIGNATURES.find(item => item.matches(buffer)) || null;
+}
+
+function sanitizeImageBasename(originalName) {
+  const base = path.basename(String(originalName || "image"), path.extname(String(originalName || "")));
+  return base.replace(/[^a-zA-Z0-9_-]/g, "_") || "image";
+}
+
+function saveValidatedImage(targetDir, file) {
+  const resolvedDir = resolveManagedPath(targetDir, DESKTOP);
+  const stat = fs.statSync(resolvedDir);
+  if (!stat.isDirectory()) throw new Error("目标目录不存在");
+  const imageInfo = detectImageInfo(file.buffer);
+  if (!imageInfo) throw new Error("图片格式无效，仅支持 PNG/JPEG/GIF/WEBP");
+  const filename = sanitizeImageBasename(file.originalname) + "_" + Date.now() + imageInfo.ext;
+  const savePath = path.join(resolvedDir, filename);
+  fs.writeFileSync(savePath, file.buffer);
+  return { filename, savePath, mime: imageInfo.mime };
+}
+
 const upload = multer({
   storage: multer.memoryStorage(),
   limits: { fileSize: 20 * 1024 * 1024 }, // 20MB
   fileFilter: (req, file, cb) => {
-    if (file.mimetype.startsWith("image/")) cb(null, true);
+    if (["image/png", "image/jpeg", "image/jpg", "image/gif", "image/webp"].includes(file.mimetype)) cb(null, true);
     else cb(new Error("只支持图片文件"));
   },
 });
@@ -1131,12 +1425,7 @@ app.post("/api/upload-image", upload.single("image"), (req, res) => {
     const inst = manager.instances.get(instanceId);
     if (!inst) return res.status(404).json({ error: "实例不存在" });
 
-    const ext      = path.extname(req.file.originalname) || ".png";
-    const base     = path.basename(req.file.originalname, ext).replace(/[^a-zA-Z0-9_-]/g, "_");
-    const filename = base + "_" + Date.now() + ext;
-    const savePath = path.join(inst.cwd, filename);
-
-    fs.writeFileSync(savePath, req.file.buffer);
+    const { filename, savePath } = saveValidatedImage(inst.cwd, req.file);
     inst.uploadedFiles.push(savePath);
     console.log("[upload] 图片已保存: " + savePath);
 
@@ -1204,7 +1493,7 @@ app.get("/api/git-info", async (req, res) => {
   const dirPath = req.query.path;
   if (!dirPath) return res.status(400).json({ error: "缺少 path 参数" });
   try {
-    const info = await getGitInfo(dirPath);
+    const info = await getGitInfo(resolveManagedPath(dirPath, DESKTOP));
     res.json(info);
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
@@ -1217,7 +1506,8 @@ app.get("/api/recent-sessions", async (req, res) => {
     let files = [];
     if (cwd) {
       // 指定目录：只扫描该项目目录
-      const projectDirName = cwd.replace(/\//g, "-").replace(/[^\x21-\x7E]/g, "-");
+      const normalizedCwd = resolveManagedPath(cwd, DESKTOP);
+      const projectDirName = normalizedCwd.replace(/\//g, "-").replace(/[^\x21-\x7E]/g, "-");
       const sessionDir = path.join(claudeProjectsDir, projectDirName);
       if (!fs.existsSync(sessionDir)) {
         return res.json([]);
@@ -1302,7 +1592,7 @@ app.get("/api/recent-sessions", async (req, res) => {
         projectName: projectName || "",
       });
     }
-    res.json(sessions);
+    res.json(sessions.filter(session => !session.cwd || isAllowedPath(session.cwd)));
   } catch (err) {
     res.status(500).json({ error: "读取会话记录失败: " + err.message });
   }
@@ -1320,20 +1610,26 @@ app.post("/api/instances", upload.single("image"), async (req, res) => {
   cliArgs = cliArgs.filter(a => typeof a === "string").map(a => String(a));
   console.log("[create] body:", JSON.stringify({ id, cwd, label, cliType, prompt: prompt.slice(0, 50), cliArgs }));
 
-  const targetCwd = cwd || DESKTOP;
+  let targetCwd;
+  try {
+    targetCwd = resolveManagedPath(cwd || "", DESKTOP);
+    if (!fs.statSync(targetCwd).isDirectory()) throw new Error("工作目录不存在");
+  } catch (err) {
+    return res.status(400).json({ error: err.message });
+  }
   let finalPrompt = prompt;
   let preUploadedPath = null;
 
   // 如果有附件图片，先保存到工作目录
   if (req.file) {
-    const ext = path.extname(req.file.originalname) || ".png";
-    const base = path.basename(req.file.originalname, ext).replace(/[^a-zA-Z0-9_-]/g, "_");
-    const filename = base + "_" + Date.now() + ext;
-    const savePath = path.join(targetCwd, filename);
-    fs.writeFileSync(savePath, req.file.buffer);
-    preUploadedPath = savePath;
-    finalPrompt = prompt + "\n\n（附件截图已保存到工作目录，文件名: " + filename + "，请查看截图内容并据此执行任务）";
-    console.log("[upload] 实例创建附件: " + savePath);
+    try {
+      const saved = saveValidatedImage(targetCwd, req.file);
+      preUploadedPath = saved.savePath;
+      finalPrompt = prompt + "\n\n（附件截图已保存到工作目录，文件名: " + saved.filename + "，请查看截图内容并据此执行任务）";
+      console.log("[upload] 实例创建附件: " + saved.savePath);
+    } catch (err) {
+      return res.status(400).json({ error: err.message });
+    }
   }
 
   try {
@@ -1349,7 +1645,12 @@ app.post("/api/instances", upload.single("image"), async (req, res) => {
       if (instance) instance.uploadedFiles.push(preUploadedPath);
     }
     res.status(201).json(inst);
-  } catch (err) { res.status(400).json({ error: err.message }); }
+  } catch (err) {
+    if (preUploadedPath) {
+      try { fs.unlinkSync(preUploadedPath); } catch (_) {}
+    }
+    res.status(400).json({ error: err.message });
+  }
 });
 // ─── 终端实例创建 ──────────────────────────────────────────────────────────────
 app.post("/api/terminal-instances", (req, res) => {
@@ -1465,15 +1766,15 @@ app.post("/api/instances/:id/tasks", upload.single("image"), (req, res) => {
 
   // 处理图片附件
   if (req.file) {
-    const ext = path.extname(req.file.originalname) || ".png";
-    const base = path.basename(req.file.originalname, ext).replace(/[^a-zA-Z0-9_-]/g, "_");
-    const filename = base + "_" + Date.now() + ext;
-    const savePath = path.join(inst.cwd, filename);
-    fs.writeFileSync(savePath, req.file.buffer);
-    task.imageFile = savePath;
-    task.imageName = filename;
-    inst.uploadedFiles.push(savePath);
-    console.log("[task-queue] 任务图片已保存: " + savePath);
+    try {
+      const saved = saveValidatedImage(inst.cwd, req.file);
+      task.imageFile = saved.savePath;
+      task.imageName = saved.filename;
+      inst.uploadedFiles.push(saved.savePath);
+      console.log("[task-queue] 任务图片已保存: " + saved.savePath);
+    } catch (err) {
+      return res.status(400).json({ error: err.message });
+    }
   }
 
   if (position >= 0 && position < inst.taskQueue.length) {
@@ -1588,16 +1889,32 @@ app.post("/api/ai-explain", async (req, res) => {
 });
 
 wss.on("connection", (ws, req) => {
-  const cookies = parseCookies(req.headers.cookie);
-  if (!sessions.has(cookies.session_token)) {
+  if (!isAllowedOrigin(req)) {
+    ws.close(4003, "请求来源不被允许");
+    return;
+  }
+  const sessionToken = getSessionToken(req);
+  if (!touchSession(sessionToken)) {
     ws.close(4001, "未授权");
     return;
   }
+  ws._sessionToken = sessionToken;
   console.log("WebSocket 客户端连接（已认证）");
   manager.subscribe("__global__", ws);
   ws.send(JSON.stringify({ type: "init", instances: manager.listInstances() }));
 
+  const sessionCheckTimer = setInterval(() => {
+    if (!getSessionByToken(ws._sessionToken)) {
+      try { ws.close(4001, "会话已过期"); } catch (_) {}
+    }
+  }, 60 * 1000);
+  sessionCheckTimer.unref();
+
   ws.on("message", raw => {
+    if (!touchSession(ws._sessionToken)) {
+      ws.close(4001, "会话已过期");
+      return;
+    }
     try {
       const msg = JSON.parse(raw.toString());
       if (msg.action === "subscribe") {
@@ -1618,18 +1935,25 @@ wss.on("connection", (ws, req) => {
   });
 
   ws.on("close", () => {
+    clearInterval(sessionCheckTimer);
     manager.unsubscribe("__global__", ws);
     manager.instances.forEach((_, id) => manager.unsubscribe(id, ws));
   });
 });
 
 const PORT = process.env.PORT || 3000;
-server.listen(PORT, "0.0.0.0", () => {
+server.listen(PORT, BIND_HOST, () => {
   console.log("AI CLI 多实例管理器启动成功");
   console.log("本机访问: http://localhost:" + PORT);
-  const ips = getLocalIPs();
-  if (ips.length > 0) {
-    ips.forEach(ip => console.log("局域网访问: http://" + ip + ":" + PORT));
+  if (isLoopbackHost(BIND_HOST)) {
+    console.log("远程访问默认关闭；如需开启，请显式设置 HOST=0.0.0.0");
+  } else if (BIND_HOST === "0.0.0.0") {
+    const ips = getLocalIPs();
+    if (ips.length > 0) {
+      ips.forEach(ip => console.log("局域网访问: http://" + ip + ":" + PORT));
+    }
+  } else {
+    console.log("监听地址: http://" + BIND_HOST + ":" + PORT);
   }
   if (process.env.AUTH_PASSWORD) {
     console.log("使用环境变量密码");
@@ -1642,6 +1966,7 @@ server.listen(PORT, "0.0.0.0", () => {
     .filter(([, p]) => p)
     .map(([k, p]) => CLI_CONFIGS[k].label + " (" + p + ")");
   console.log("可用 CLI: " + (availCLIs.length ? availCLIs.join(", ") : "无 (Mock 模式)"));
+  console.log("允许访问根目录: " + ALLOWED_ROOTS.join(", "));
 
   // 启动 Cloudflare Tunnel（可通过 TUNNEL=0 禁用）
   startTunnel(PORT);

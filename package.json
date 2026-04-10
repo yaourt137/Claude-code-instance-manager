@@ -1,0 +1,17 @@
+{
+  "name": "claude-code-manager",
+  "version": "2.0.0",
+  "description": "Claude Code 多实例网页管理器（PTY 交互模式）",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js",
+    "install-rebuild": "npm install && npm rebuild node-pty"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.29.0",
+    "express": "^4.18.2",
+    "multer": "^2.1.1",
+    "node-pty": "^1.0.0",
+    "ws": "^8.16.0"
+  }
+}

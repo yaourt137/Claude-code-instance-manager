@@ -1,0 +1,24 @@
+node_modules/
+ref/
+
+# 运行时生成的敏感配置（包含密码哈希和 API Key）
+auth-settings.json
+ai-settings.json
+
+# 运行时数据
+recent-dirs.json
+task-images/
+
+# 环境变量
+.env
+.env.*
+
+# Claude Code 本地配置
+.claude/settings.local.json
+
+# macOS
+.DS_Store
+
+# 日志
+*.log
+npm-debug.log*
